@@ -20,9 +20,9 @@ from types import SimpleNamespace
 import pytest
 from loguru import logger
 
-from pipecat.adapters.schemas.direct_function import tool_options
-from pipecat.adapters.schemas.function_schema import FunctionSchema
-from pipecat.adapters.schemas.tools_schema import ToolsSchema
+from pipecat.adapters.llm.schemas.direct_function import tool_options
+from pipecat.adapters.llm.schemas.function_schema import FunctionSchema
+from pipecat.adapters.llm.schemas.tools_schema import ToolsSchema
 from pipecat.clocks.system_clock import SystemClock
 from pipecat.frames.frames import (
     InterruptionFrame,

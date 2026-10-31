@@ -269,6 +269,32 @@ class TestEvalsScenarioParser(unittest.TestCase):
         self.assertTrue(s.user_audio)
         self.assertEqual(s.user_speech, {"service": "cartesia", "voice": "v1"})
 
+    def test_user_turn_with_pauses(self):
+        s = _script(
+            _write(
+                "name: a\n"
+                "user: {modality: audio, speech: {service: kokoro, voice: v1}}\n"
+                "turns:\n"
+                "  - user: ['So last week I went to', {pause_ms: 2000}, 'Spain.']\n"
+            )
+        )
+        turn = s.turns[0]
+        self.assertEqual(turn.user, "So last week I went to Spain.")
+        self.assertEqual(turn.parts, ["So last week I went to", 2000, "Spain."])
+
+    def test_user_turn_pauses_are_validated(self):
+        audio = "user: {modality: audio, speech: {service: kokoro, voice: v1}}\n"
+        cases = {
+            "pauses but no text": audio + "turns: [{user: [{pause_ms: 500}]}]\n",
+            "items must be text": audio + "turns: [{user: ['Hi', {pause_ms: 0}]}]\n",
+            "text modality": "turns: [{user: ['Hi', {pause_ms: 500}, 'there']}]\n",
+        }
+        for message, body in cases.items():
+            with self.subTest(message=message):
+                with self.assertRaises(ValueError) as cm:
+                    _script(_write("name: a\n" + body))
+                self.assertIn(message, str(cm.exception))
+
     def test_user_audio_requires_speech(self):
         with self.assertRaises(ValueError) as cm:
             _script(
@@ -326,6 +352,40 @@ class TestEvalsScenarioParser(unittest.TestCase):
         self.assertIsNone(exp.calls)
         self.assertFalse(exp.absent)
 
+    def test_text_matches_parsed(self):
+        s = _script(
+            _write(
+                """
+                name: matches
+                turns:
+                  - user: "x"
+                    expect:
+                      - event: llm_response
+                        text_matches: "^Hi"
+                      - event: llm_response
+                        text_matches: ["^Hi", "!$"]
+                """
+            )
+        )
+        self.assertEqual(s.turns[0].expect[0].text_matches, ["^Hi"])
+        self.assertEqual(s.turns[0].expect[1].text_matches, ["^Hi", "!$"])
+
+    def test_text_matches_rejects_bad_patterns(self):
+        for value in ('"(unclosed"', "[1, 2]"):
+            with self.assertRaises(ValueError):
+                _script(
+                    _write(
+                        f"""
+                        name: bad_matches
+                        turns:
+                          - user: "x"
+                            expect:
+                              - event: llm_response
+                                text_matches: {value}
+                        """
+                    )
+                )
+
     def test_absent_expectation_parsed(self):
         s = _script(
             _write(
@@ -347,7 +407,12 @@ class TestEvalsScenarioParser(unittest.TestCase):
         self.assertEqual(exp.within_ms, 5000)
 
     def test_absent_rejects_content_checks(self):
-        for extra in ('eval: "repeats itself"', 'text_contains: "again"', 'text_excludes: "x"'):
+        for extra in (
+            'eval: "repeats itself"',
+            'text_contains: "again"',
+            'text_excludes: "x"',
+            'text_matches: "x"',
+        ):
             with self.assertRaises(ValueError):
                 _script(
                     _write(

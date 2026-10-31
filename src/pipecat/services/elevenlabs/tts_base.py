@@ -405,6 +405,11 @@ def _select_alignment(
     return msg.get(alignment_key) or msg.get(normalized_key)
 
 
+def _ends_in_audio_tag(word: str) -> bool:
+    """Whether a word ends inside a bracketed audio tag, as one cut off between chunks does."""
+    return word.rfind("[") > word.rfind("]")
+
+
 def _strip_utterance_leading_spaces(
     alignment: Mapping[str, Any], keys: tuple[str, str, str], should_strip: bool
 ) -> Mapping[str, Any]:
@@ -445,6 +450,8 @@ def calculate_word_times(
     cumulative_time: float,
     partial_word: str = "",
     partial_word_start_time: float = 0.0,
+    *,
+    audio_tags: bool = False,
 ) -> tuple[list[tuple[str, float]], str, float]:
     """Calculate word timestamps from character alignment information.
 
@@ -453,6 +460,10 @@ def calculate_word_times(
         cumulative_time: Base time offset for this chunk.
         partial_word: Partial word carried over from previous chunk.
         partial_word_start_time: Start time of the partial word.
+        audio_tags: Whether a bracketed audio tag, such as ``[short pause]``,
+            is one word, spaces and all. Eleven v3 and v4 return the tags they
+            perform in the alignment, and a tag reported whole matches the text
+            it was sent in.
 
     Returns:
         Tuple of (word_times, new_partial_word, new_partial_word_start_time):
@@ -474,9 +485,12 @@ def calculate_word_times(
     word_start_times = []
     current_word = partial_word  # Start with any partial word from previous chunk
     word_start_time = partial_word_start_time if partial_word else None
+    in_tag = audio_tags and _ends_in_audio_tag(current_word)
 
     for i, char in enumerate(chars):
-        if char == " ":
+        if audio_tags and char in "[]":
+            in_tag = char == "["
+        if char == " " and not in_tag:
             # End of current word
             if current_word:  # Only add non-empty words
                 words.append(current_word)
@@ -565,7 +579,6 @@ class ElevenLabsTTSBase(WebsocketTTSService):
         self._partial_word_start_time = 0.0
 
         self._receive_task = None
-        self._keepalive_task = None
 
     def can_generate_metrics(self) -> bool:
         """Check if this service can generate processing metrics.
@@ -682,8 +695,8 @@ class ElevenLabsTTSBase(WebsocketTTSService):
         if self._websocket and not self._receive_task:
             self._receive_task = self.create_task(self._receive_task_handler(self._report_error))
 
-        if self._websocket and not self._keepalive_task:
-            self._keepalive_task = self.create_task(self._keepalive_task_handler())
+        if self._websocket:
+            self._create_keepalive_task(interval=10)
 
     async def _disconnect(self):
         await super()._disconnect()
@@ -692,9 +705,7 @@ class ElevenLabsTTSBase(WebsocketTTSService):
             await self.cancel_task(self._receive_task)
             self._receive_task = None
 
-        if self._keepalive_task:
-            await self.cancel_task(self._keepalive_task)
-            self._keepalive_task = None
+        await self._cancel_keepalive_task()
 
         await self._disconnect_websocket()
 
@@ -778,17 +789,6 @@ class ElevenLabsTTSBase(WebsocketTTSService):
         """Reset alignment state after all audio for the context has played."""
         self._reset_alignment_state(context_id)
         await super().on_audio_context_completed(context_id)
-
-    async def _keepalive_task_handler(self):
-        """Send periodic keepalive messages to maintain WebSocket connection."""
-        KEEPALIVE_SLEEP = 10
-        while True:
-            await asyncio.sleep(KEEPALIVE_SLEEP)
-            try:
-                await self._send_keepalive()
-            except websockets.ConnectionClosed as e:
-                logger.warning(f"{self} keepalive error: {e}")
-                break
 
     @traced_tts
     async def run_tts(self, text: str, context_id: str) -> AsyncGenerator[Frame | None, None]:
