@@ -32,9 +32,10 @@ Event names are the friendly names the harness maps RTVI server messages onto:
 ``vad_user_stopped_speaking``, ``user_transcription``, ``bot_started_speaking``,
 ``bot_stopped_speaking``, ``llm_started``, ``response``, ``llm_response``,
 ``llm_marker``, ``tts_response``, ``function_call``, ``function_call_stopped``,
-``image``. The ``vad_*`` events are the raw
-VAD signal, useful as a timing anchor when a turn-detection strategy gates or defers the
-turn-level ``user_stopped_speaking`` (e.g. filtering incomplete turns).
+``image``, ``bot_backchannel``, ``user_backchannel``, ``expression``. The ``vad_*``
+events are the raw VAD signal, useful as a timing anchor when a turn-detection strategy
+gates or defers the turn-level ``user_stopped_speaking`` (e.g. filtering incomplete
+turns).
 
 ``image`` is an image the bot output, such as a generated one; the bot reports
 images only to a scenario that expects one::
@@ -118,6 +119,11 @@ Supported expectation fields (per event):
 
 ``text_excludes: <str>``
     the reverse: the event's text content must not hold this substring
+
+``text_matches: <regex> | [<regex>, ...]``
+    regular expressions (Python ``re.search``) the event's text content must
+    each match, such as a format the reply must open with. The failure names
+    the first pattern that did not match
 
 ``marker: <str>``
     for ``llm_marker`` — the marker's meaning: ``complete``, ``short``, ``long``,
@@ -240,6 +246,16 @@ is sent at its own sample rate, so it need not match the bot's input rate, and
           - event: response
             eval: "the response says the capital of Germany is Berlin"
 
+In audio modality a spoken turn may also pause, as a person does mid-thought:
+``user:`` is then a list of text and ``pause_ms:`` silences, played to the bot
+as one stretch of audio. The judge and ``text_contains`` see the text alone::
+
+    turns:
+      - user:
+          - "So last week I went to"
+          - pause_ms: 2000
+          - "Spain with my family."
+
 ``expect:`` is optional; omit it for a turn that only sends input or only waits.
 
 Top-level optional fields:
@@ -310,6 +326,7 @@ relative to the scenario file's directory. This is handy for sharing the
     judge: !include judge_audio.yaml
 """
 
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -326,12 +343,13 @@ from pipecat.evals.scenario_config import (
 from pipecat.utils.deprecation import deprecated
 
 # Events whose payloads carry bot-generated text the judge can sensibly
-# evaluate. Asserting ``eval:`` on anything else but a function call (user
-# transcripts, interruption signals) produces a parser warning — the test
-# controls user input deterministically, so judging it adds cost without
-# signal. ``response`` is the modality-agnostic alias, resolved to one of the
-# others after parsing (see _resolve_response_events).
-JUDGEABLE_EVENTS = frozenset({"response", "llm_response", "tts_response"})
+# evaluate, including the expression the bot's TTS performed. Asserting
+# ``eval:`` on anything else but a function call (user transcripts,
+# interruption signals) produces a parser warning — the test controls user
+# input deterministically, so judging it adds cost without signal.
+# ``response`` is the modality-agnostic alias, resolved to one of the others
+# after parsing (see _resolve_response_events).
+JUDGEABLE_EVENTS = frozenset({"response", "llm_response", "tts_response", "expression"})
 
 # Events carrying a function call, matched by name and arguments rather than by
 # text: ``function_call`` when one starts, ``function_call_stopped`` when it ends
@@ -389,15 +407,19 @@ class EvalExpectation:
         text_excludes: Optional substring the event's text content must not
             hold. Checked on the text the expectation matched; with
             ``text_contains``, on the reply accumulated up to the match.
+        text_matches: Optional regular expressions (``re.search``) the event's
+            text content must each match, checked on the same text as
+            ``text_excludes``.
         calls: For a ``function_call`` event, the set of calls expected in the
             turn. They are matched by name in any order and the expectation passes
             only when all of them are found. Built from ``calls:`` in the YAML, or
             from the single ``name:``/``args:`` shorthand.
         eval: Optional natural-language criterion the event's text content
             must satisfy. Evaluated by a judge LLM. Meaningful on the
-            bot-generated text events (``response``, ``llm_response``, and
-            ``tts_response``) and on the function-call events, where it is
-            about each matched call's name and arguments rather than text.
+            bot-generated text events (``response``, ``llm_response``,
+            ``tts_response``, and the ``expression`` its TTS performed) and on
+            the function-call events, where it is about each matched call's
+            name and arguments rather than text.
         marker: For an ``llm_marker`` event, the meaning the marker must have:
             one of :data:`MARKER_KINDS`, where ``incomplete`` accepts ``short``
             or ``long``.
@@ -414,14 +436,15 @@ class EvalExpectation:
         absent: When True, the expectation is inverted: it passes only when NO
             event of this type arrives before the ``within_ms`` budget expires,
             and fails as soon as one does. Matches on event type only;
-            ``text_contains``, ``text_excludes``, ``eval``, ``calls`` and the
-            marker checks are not allowed alongside it.
+            ``text_contains``, ``text_excludes``, ``text_matches``, ``eval``,
+            ``calls`` and the marker checks are not allowed alongside it.
     """
 
     event: str
     within_ms: int | None = None
     text_contains: str | None = None
     text_excludes: str | None = None
+    text_matches: list[str] | None = None
     calls: list[EvalFunctionCall] | None = None
     eval: str | None = None
     marker: str | None = None
@@ -435,10 +458,11 @@ class EvalExpectation:
     def aggregates(self) -> bool:
         """Whether the check accumulates text across events rather than matching one.
 
-        A reply with a content check accumulates the bot's segments; a
+        A reply with a content check accumulates the bot's segments, and an
+        ``expression`` check the expression performed in the turn; a
         ``user_transcription`` with ``text_contains`` accumulates an STT's pieces.
         """
-        if self.event in ("response", "llm_response", "tts_response"):
+        if self.event in ("response", "llm_response", "tts_response", "expression"):
             return self.text_contains is not None or self.eval is not None
         if self.event == "user_transcription":
             return self.text_contains is not None and self.eval is None
@@ -489,6 +513,9 @@ class EvalScriptTurn:
             ``send-text`` in text modality, or synthesized speech (``raw-audio``)
             in audio modality. If absent, the turn just waits for and asserts on
             expected events.
+        parts: The turn's text and pauses, in order, when it pauses: text to
+            speak, or the milliseconds of silence between texts. ``user`` then
+            holds the text alone. Requires ``user.modality: audio``.
         audio: Optional path to an audio file (resolved relative to the scenario
             file) played as this turn instead of synthesizing ``user``. Any
             format ``soundfile`` reads works (WAV, MP3, FLAC, OGG, ...);
@@ -519,6 +546,7 @@ class EvalScriptTurn:
 
     user: str | None
     expect: list[EvalExpectation] = field(default_factory=list)
+    parts: list[str | int] | None = None
     audio: str | None = None
     dtmf: str | None = None
     send_after: EvalSendAfter | None = None
@@ -764,6 +792,11 @@ def _check_user_audio(
                 f"{path}: turn #{idx} has 'audio:' but the scenario is text modality — "
                 "set 'user.modality: audio' to play it to the bot"
             )
+        if turn.parts is not None and not user_audio:
+            raise ValueError(
+                f"{path}: turn #{idx} pauses in 'user:' but the scenario is text modality — "
+                "set 'user.modality: audio' to speak it to the bot"
+            )
 
     # A turn naming a file is played as-is; only the rest need a voice to speak them.
     if user_audio and speech is None:
@@ -800,9 +833,7 @@ def _parse_turn(t: Any, path: Path, idx: int) -> EvalScriptTurn:
     if not isinstance(t, dict):
         raise ValueError(f"{path}: turn #{idx} must be a mapping")
 
-    user = t.get("user")
-    if user is not None and not isinstance(user, str):
-        raise ValueError(f"{path}: turn #{idx} 'user:' must be a string if present")
+    user, parts = _parse_user(t.get("user"), path, idx)
 
     dtmf = _parse_dtmf(t.get("dtmf"), path, idx)
     if user is not None and dtmf is not None:
@@ -839,6 +870,11 @@ def _parse_turn(t: Any, path: Path, idx: int) -> EvalScriptTurn:
                 f"{path}: turn #{idx} has 'audio:' but no 'user:' — give the text the "
                 "recording says, so the judge and 'text_contains' have the turn's input"
             )
+        if parts is not None:
+            raise ValueError(
+                f"{path}: turn #{idx} has both 'audio:' and pauses in 'user:' — "
+                "a recording has its own pauses"
+            )
         audio = str((path.parent / audio).resolve())
 
     # Image paths resolve relative to the scenario file, so a scenario is portable.
@@ -849,7 +885,41 @@ def _parse_turn(t: Any, path: Path, idx: int) -> EvalScriptTurn:
         image = str((path.parent / image).resolve())
 
     return EvalScriptTurn(
-        user=user, dtmf=dtmf, expect=expect, send_after=send_after, image=image, audio=audio
+        user=user,
+        parts=parts,
+        dtmf=dtmf,
+        expect=expect,
+        send_after=send_after,
+        image=image,
+        audio=audio,
+    )
+
+
+def _parse_user(user: Any, path: Path, turn_idx: int) -> tuple[str | None, list[str | int] | None]:
+    """Parse a turn's ``user:``: its text, and its text and pauses when it pauses."""
+    if user is None or isinstance(user, str):
+        return user, None
+    if not isinstance(user, list):
+        raise ValueError(
+            f"{path}: turn #{turn_idx} 'user:' must be a string, or a list of text and pauses"
+        )
+    parts = [_parse_user_part(part, path, turn_idx) for part in user]
+    texts = [part for part in parts if isinstance(part, str)]
+    if not texts:
+        raise ValueError(f"{path}: turn #{turn_idx} 'user:' has pauses but no text")
+    return " ".join(texts), parts
+
+
+def _parse_user_part(part: Any, path: Path, turn_idx: int) -> str | int:
+    """Parse one item of a pausing ``user:``: text, or a pause's milliseconds."""
+    if isinstance(part, str) and part.strip():
+        return part.strip()
+    if isinstance(part, dict) and set(part) == {"pause_ms"}:
+        pause_ms = part["pause_ms"]
+        if isinstance(pause_ms, int) and not isinstance(pause_ms, bool) and pause_ms > 0:
+            return pause_ms
+    raise ValueError(
+        f"{path}: turn #{turn_idx} 'user:' items must be text or 'pause_ms: <positive int>'"
     )
 
 
@@ -953,6 +1023,7 @@ def _parse_expectation(e: Any, path: Path, turn_idx: int, exp_idx: int) -> EvalE
             for key in (
                 "text_contains",
                 "text_excludes",
+                "text_matches",
                 "eval",
                 "calls",
                 "name",
@@ -991,11 +1062,24 @@ def _parse_expectation(e: Any, path: Path, turn_idx: int, exp_idx: int) -> EvalE
         ):
             raise ValueError(f"{where} '{key}:' must be a {kind.__name__}")
 
+    text_matches = e.get("text_matches")
+    if isinstance(text_matches, str):
+        text_matches = [text_matches]
+    if text_matches is not None:
+        if not isinstance(text_matches, list) or not all(isinstance(p, str) for p in text_matches):
+            raise ValueError(f"{where} 'text_matches:' must be a pattern or a list of patterns")
+        for pattern in text_matches:
+            try:
+                re.compile(pattern)
+            except re.error as ex:
+                raise ValueError(f"{where} 'text_matches:' pattern {pattern!r}: {ex}") from ex
+
     return EvalExpectation(
         event=event,
         within_ms=e.get("within_ms"),
         text_contains=e.get("text_contains"),
         text_excludes=e.get("text_excludes"),
+        text_matches=text_matches,
         calls=calls,
         eval=criterion,
         marker=marker,

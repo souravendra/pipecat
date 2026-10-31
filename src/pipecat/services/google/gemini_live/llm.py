@@ -26,10 +26,10 @@ from PIL import Image
 from pydantic import BaseModel, Field
 from typing_extensions import override
 
-from pipecat.adapters.schemas.direct_function import DirectFunction
-from pipecat.adapters.schemas.function_schema import FunctionSchema
-from pipecat.adapters.schemas.tools_schema import ToolsSchema
-from pipecat.adapters.services.gemini_live_adapter import GeminiLiveLLMAdapter
+from pipecat.adapters.llm.schemas.direct_function import DirectFunction
+from pipecat.adapters.llm.schemas.function_schema import FunctionSchema
+from pipecat.adapters.llm.schemas.tools_schema import ToolsSchema
+from pipecat.adapters.llm.services.gemini_live_adapter import GeminiLiveLLMAdapter
 from pipecat.frames.frames import (
     BotStartedSpeakingFrame,
     BotStoppedSpeakingFrame,
@@ -389,7 +389,9 @@ class GeminiLiveLLMSettings(LLMSettings):
     Parameters:
         voice: TTS voice identifier (e.g. ``"Charon"``).
         modalities: Response modalities.
-        language: Language for generation.
+        language: Language for generation. A ``Language`` value is sent as
+            Gemini's locale code (``Language.ES`` as ``"es-ES"``); a string is
+            sent as given.
         media_resolution: Media resolution setting.
         vad: Voice activity detection parameters.
         turn_coverage: Which realtime input a user turn covers. Unset uses the
@@ -747,6 +749,8 @@ class GeminiLiveLLMService(LLMService[GeminiLiveLLMAdapter]):
         # 4. Apply settings delta (canonical API, always wins)
         if settings is not None:
             default_settings.apply_update(settings)
+        if isinstance(default_settings.language, Language):
+            default_settings.language = language_to_gemini_language(default_settings.language)
 
         # Warn if user requested TEXT modality
         default_modalities = assert_given(default_settings.modalities)
@@ -884,6 +888,9 @@ class GeminiLiveLLMService(LLMService[GeminiLiveLLMAdapter]):
 
         Settings are stored but not applied to the active connection.
         """
+        if isinstance(delta, self.Settings) and isinstance(delta.language, Language):
+            delta.language = language_to_gemini_language(delta.language)
+
         changed = await super()._update_settings(delta)
 
         if not changed:
