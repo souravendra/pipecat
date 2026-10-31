@@ -510,6 +510,8 @@ class _Usage:
     input_tokens = 0
     output_tokens = 0
     total_tokens = 0
+    input_token_details = None
+    output_token_details = None
 
 
 class _Response:
